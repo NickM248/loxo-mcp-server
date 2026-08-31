@@ -12,8 +12,12 @@ const env = validateEnv();
 // Construct API base URL using domain from config
 const LOXO_API_BASE = `https://${env.LOXO_DOMAIN}/api`;
 
-// MCP Best Practice: Character limit for responses to prevent overwhelming context
-const CHARACTER_LIMIT = 100000;
+// Configurable response size limit (default 250K, override via LOXO_MCP_RESPONSE_LIMIT env var)
+const CHARACTER_LIMIT = env.LOXO_MCP_RESPONSE_LIMIT;
+
+// Fallback key validator for loxo_update_candidate's extra_fields, used when
+// the LOXO_PERSON_KEY_CACHE global is absent (e.g. offline tests).
+const SAFE_PERSON_FIELD_KEY = /^[a-zA-Z][a-zA-Z0-9_]*$/;
 
 // Helper function to truncate responses with clear messaging
 function truncateResponse(content: string, limit: number = CHARACTER_LIMIT): { text: string; wasTruncated: boolean } {
@@ -49,6 +53,22 @@ function requireNumericId(value: unknown, fieldName: string): string {
     throw new Error(`Invalid ${fieldName}: expected a numeric ID, got "${value}"`);
   }
   return str;
+}
+
+// Resolves the owner ID for a write-to-person operation.
+// Precedence: explicit arg > LOXO_DEFAULT_OWNER_ID env var (validated) > undefined.
+// Defense-in-depth: config.ts already rejects non-numeric values at startup via
+// process.exit(1). This runtime guard handles test-time env injection (vi.stubEnv)
+// and hypothetical future direct process.env mutations.
+function resolveOwnerId(explicitArg: string | undefined): string | undefined {
+  if (explicitArg) return explicitArg;
+  const envValue = process.env.LOXO_DEFAULT_OWNER_ID;
+  return envValue && /^\d+$/.test(envValue) ? envValue : undefined;
+}
+
+function resolveOwnerEmail(explicitArg: string | undefined): string | undefined {
+  if (explicitArg) return explicitArg;
+  return process.env.LOXO_DEFAULT_OWNER_EMAIL || undefined;
 }
 
 // Add these type definitions near the top with other types
@@ -355,6 +375,18 @@ const PersonEventSchema = z.object({
   created_at: z.string().optional(), // For scheduled events, set future datetime
 });
 
+const GetCandidateActivitiesSchema = z.object({
+  person_id: z.coerce.string().regex(/^\d+$/, "person_id must be numeric"),
+  per_page: z.coerce.number().int().positive().optional(),
+  scroll_id: z.string().optional(),
+  response_format: z.enum(['json', 'markdown']).optional(),
+  activity_type_ids: z
+    .array(z.coerce.string().regex(/^\d+$/, "activity_type_ids[] must all be numeric"))
+    .nonempty("activity_type_ids cannot be an empty array")
+    .optional()
+    .describe("Filter to only these activity types. Use loxo_get_activity_types to discover IDs."),
+});
+
 const SearchSchema = z.object({
     query: z.string().optional(),
     company: z.string().optional(),
@@ -390,6 +422,11 @@ const GetCompanyDetailsSchema = z.object({
   company_id: z.number().int().describe("The ID of the company to retrieve.")
 });
 
+// Schema for create-company tool
+const CreateCompanySchema = z.object({
+  name: z.string().trim().min(1, "name is required").describe("Company name (required)."),
+});
+
 // Schema for list-users tool
 const ListUsersSchema = z.object({}); // No specific input parameters
 
@@ -409,6 +446,7 @@ const CreateCandidateSchema = z.object({
   current_title: z.string().optional().describe("Current job title."),
   current_company: z.string().optional().describe("Current employer name."),
   location: z.string().optional().describe("City, region, or country."),
+  owned_by_id: z.coerce.string().regex(/^\d+$/, "owned_by_id must be numeric").optional().describe("Loxo user ID to set as record owner. Overrides LOXO_DEFAULT_OWNER_ID env var."),
 });
 
 const UpdateCandidateSchema = z.object({
@@ -424,6 +462,22 @@ const UpdateCandidateSchema = z.object({
   sector_ids: z.array(z.number().int()).optional().describe("Sector hierarchy IDs. Use loxo_list_skillsets to discover IDs. E.g. [5690364] for Financial Services."),
   person_type_id: z.number().int().optional().describe("Person type ID. 80073=Active Candidate, 78122=Prospect Candidate. Use loxo_list_person_types to discover."),
   source_type_id: z.number().int().optional().describe("Source type ID. E.g. 1206583=LinkedIn, 1206592=API. Use loxo_list_source_types to discover."),
+  owned_by_id: z.coerce.string().regex(/^\d+$/, "owned_by_id must be numeric").optional().describe("Loxo user ID to set as record owner. Overrides LOXO_DEFAULT_OWNER_ID env var."),
+  replace_tags: z.boolean().optional().default(false).describe(
+    "When true, REPLACES existing tags with the provided array (uses person[all_raw_tags][]). When false (default), adds the provided tags additively (uses person[raw_tags][]) and leaves existing tags untouched."
+  ),
+  salary: z.number().optional().describe("Current salary, numeric (no currency symbol). Pair with compensation_currency_id."),
+  compensation: z.number().optional().describe("Total compensation including base + bonus + equity, numeric."),
+  compensation_currency_id: z.number().optional().describe("Currency ID. Use loxo_list_currencies to discover IDs."),
+  salary_type_id: z.number().optional().describe("Salary type ID (e.g. annual, hourly). Use loxo_list_salary_types to discover IDs."),
+  bonus: z.number().optional().describe("Bonus amount, numeric."),
+  description: z.string().optional().describe("The bio / recruiter notes blob. Free text. Replaces existing description."),
+  extra_fields: z.record(
+    z.string(),
+    z.union([z.string(), z.number(), z.array(z.union([z.string(), z.number()]))])
+  ).optional().describe(
+    "Map of {loxo_key: value} for any top-level person field not already covered by an explicit parameter (built-in or tenant-specific dynamic fields, all addressable via person[<key>]). Keys are validated against the dynamic_fields schema cached at server startup; with a cache miss they fall back to /^[a-zA-Z][a-zA-Z0-9_]*$/. Values may be string, number, or an array of strings/numbers (used for Hierarchy fields like skillset_ids that Loxo writes as person[<key>][] form entries, per Phase 0.3 verification)."
+  ),
 });
 
 const AddToPipelineSchema = z.object({
@@ -438,6 +492,45 @@ const UploadResumeSchema = z.object({
   file_content_base64: z.string().describe("Base64-encoded file content."),
 });
 
+const ListDealWorkflowsSchema = z.object({
+  response_format: z.enum(['json', 'markdown']).optional(),
+});
+
+const GetDealWorkflowSchema = z.object({
+  id: z.coerce.string().regex(/^\d+$/, "id must be numeric").describe("Deal workflow ID"),
+  response_format: z.enum(['json', 'markdown']).optional(),
+});
+
+const SearchDealsSchema = z.object({
+  query: z.string().optional().describe("Lucene query string"),
+  owner_emails: z.array(z.string().email()).optional().describe("Filter by owner email addresses"),
+  scroll_id: z.string().optional().describe("Pagination cursor from previous search"),
+  response_format: z.enum(['json', 'markdown']).optional(),
+});
+
+const GetDealSchema = z.object({
+  id: z.coerce.string().regex(/^\d+$/, "id must be numeric").describe("Deal ID"),
+  response_format: z.enum(['json', 'markdown']).optional(),
+});
+
+const CreateDealSchema = z.object({
+  name: z.string().trim().min(1, "name is required").describe("Deal name (required)"),
+  amount: z.number().describe("Deal value/amount (required)"),
+  closes_at: z.string().describe("Expected close date, ISO datetime (required)"),
+  workflow_id: z.coerce.string().regex(/^\d+$/, "workflow_id must be numeric").describe("Deal workflow/pipeline ID (required). Use loxo_list_deal_workflows to find."),
+  pipeline_stage_id: z.coerce.string().regex(/^\d+$/, "pipeline_stage_id must be numeric").describe("Initial pipeline stage ID (required). Use loxo_get_deal_workflow to find stage IDs."),
+  owner_email: z.string().email().optional().describe("Owner email. Falls back to LOXO_DEFAULT_OWNER_EMAIL env var."),
+  company_id: z.coerce.string().regex(/^\d+$/, "company_id must be numeric").optional().describe("Associated company ID"),
+  person_id: z.coerce.string().regex(/^\d+$/, "person_id must be numeric").optional().describe("Associated person/contact ID"),
+  job_id: z.coerce.string().regex(/^\d+$/, "job_id must be numeric").optional().describe("Associated job ID"),
+});
+
+const LogDealActivitySchema = z.object({
+  deal_id: z.coerce.string().regex(/^\d+$/, "deal_id must be numeric").describe("Deal ID"),
+  activity_type_id: z.coerce.string().regex(/^\d+$/, "activity_type_id must be numeric").describe("Activity type ID. Use loxo_get_activity_types with the deal's workflow_id to find valid IDs."),
+  notes: z.string().optional().describe("Optional notes for this activity"),
+});
+
 type PersonEventArgs = z.infer<typeof PersonEventSchema>;
 type SearchArgs = z.infer<typeof SearchSchema>; // Generic search, might deprecate if specific ones cover all uses
 type TypeSearchCandidatesArgs = z.infer<typeof SearchCandidatesSchema>;
@@ -446,6 +539,42 @@ type TypeGetCompanyDetailsArgs = z.infer<typeof GetCompanyDetailsSchema>;
 // No specific type needed for ListUsersArgs as it's an empty object
 
 type EntityIdArg = z.infer<typeof EntityIdSchema>;
+
+// Activity types that represent pipeline state transitions or automation events.
+// Used by loxo_get_candidate_brief to filter out noise and return only intel-rich activities.
+const NOISE_ACTIVITY_TYPE_IDS = new Set([
+  1550048, // Marked as Maybe
+  1550049, // Marked as Yes
+  1550050, // Longlisted
+  1550052, // Sent Automated Email
+  1550054, // Applied
+  1550055, // Added to Job
+  1550056, // Unsourced
+  1550057, // Outbound
+  1550066, // Outreach™ Task Completed
+  1550067, // Outreach™ SMS Sent
+  1550068, // Outreach™ Email Sent
+  1550069, // Outreach™ Added to Call Queue
+  1550070, // Submitted
+  1550071, // Scheduling
+  1550072, // Consultant Interview
+  1550073, // 1st Client Interview
+  1550074, // 2nd Client Interview
+  1550075, // 3rd Client Interview
+  1550076, // Final Client Interview
+  1550077, // Hold
+  1550078, // Offer Extended
+  1550079, // Hired
+  1550080, // Rejected
+  1550081, // Rejected by Client
+  1550082, // Rejected by Candidate
+  1550083, // Rejected by Consultant
+  1550084, // Loxo AI Sourced
+  1550085, // Form Filled
+  2311492, // Linkedin Connection Request
+  2373096, // Pitched
+  2925520, // Updated by Self-updating CRM Agent
+]);
 
 // Create server instance
 const server = new Server(
@@ -466,7 +595,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "loxo_get_activity_types",
-        description: "Get a list of all available activity types in Loxo (e.g., calls, meetings, interviews). Use this before scheduling or logging activities to find the correct activity_type_id. Example: Call this first to get activity type IDs, then use loxo_schedule_activity with the correct ID.",
+        description: "Get a list of all available activity types in Loxo (e.g., calls, meetings, interviews). Use this before scheduling or logging activities to find the correct activity_type_id. Pass a deal workflow_id to get deal-specific activity types (e.g. 'Deal Won', 'New Lead') instead of candidate activity types. Example: Call loxo_list_deal_workflows to get the workflow ID, then pass it here.",
         inputSchema: {
           type: "object",
           properties: {
@@ -474,6 +603,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               enum: ["json", "markdown"],
               description: "Response format: 'json' for structured data (default), 'markdown' for human-readable formatted text"
+            },
+            workflow_id: {
+              type: "string",
+              description: "Optional: Filter by workflow ID. Pass a deal workflow ID to get deal-specific activity types instead of candidate activity types. Use loxo_list_deal_workflows to find workflow IDs."
             }
           },
           required: [],
@@ -568,7 +701,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "loxo_search_candidates",
-        description: "Search for candidates using Lucene query syntax. Uses cursor-based pagination with scroll_id. Returns skillsets and tags in results for filtering without additional API calls.\n\nIMPORTANT - LOXO FIELD NAME MAPPING:\n- Query uses 'skills' (search index field): query='skills:\"Python\"'\n- Response returns 'skillsets' (API field): {skillsets: \"Python, JavaScript\"}\n- Query uses 'all_raw_tags', response returns 'all_raw_tags' (same)\n\nSIMPLE QUERY EXAMPLES:\n(1) Past employer: query='job_profiles.company_name:\"Google\"'\n(2) Skills: query='skills:\"Python\"'\n(3) Current role: company='Acme Corp' and title='Engineer'\n\nCOMPLEX MULTI-CRITERIA EXAMPLES:\n(4) Multiple titles with skills: query='(current_title:\"Director\" OR current_title:\"Senior Director\") AND skills:\"financial due diligence\"'\n(5) Multiple role types at specific level: query='(current_title:(\"Deal Advisory\" OR \"Transaction Services\" OR \"Transaction Advisory\")) AND current_title:\"Director\" AND skills:\"due diligence\"'\n(6) Past companies with skills: query='(job_profiles.company_name:(\"KPMG\" OR \"Deloitte\" OR \"PwC\" OR \"EY\")) AND skills:(\"M&A\" OR \"financial due diligence\")'\n(7) Combined current AND past: query='current_title:\"Director\" AND job_profiles.company_name:(\"Big 4\") AND skills:\"financial modeling\"'\n(8) Tags: query='all_raw_tags:\"key account\"'\n\nNULL/EMPTY FIELD SEARCHES (data quality checks):\n(9) Candidates WITHOUT skills: query='NOT _exists_:skills'\n(10) Candidates WITH skills: query='_exists_:skills'\n(11) Candidates WITHOUT tags: query='NOT _exists_:all_raw_tags'\n(12) Candidates missing location: query='NOT _exists_:location'\n(13) Candidates missing current company: query='NOT _exists_:current_company'\n\nTIPS: Use OR for multiple options, AND to combine criteria, parentheses for grouping, NOT _exists_:fieldname for null checks. ALWAYS use search index field names (skills not skillsets) in queries. Start with comprehensive queries to get all relevant candidates in fewer API calls.\n\nReturns: id, name, current_title, current_company, location, skillsets (from 'skills' field), all_raw_tags. Use scroll_id from pagination for next page.",
+        description: "Search for candidates using Lucene query syntax. Uses cursor-based pagination with scroll_id. Returns skillsets and tags in results for filtering without additional API calls.\n\nIMPORTANT - LOXO FIELD NAME MAPPING:\n- Query uses 'skills' (search index field): query='skills:\"Python\"'\n- Response returns 'skillsets' (API field): {skillsets: \"Python, JavaScript\"}\n- Query uses 'all_raw_tags', response returns 'all_raw_tags' (same)\n\nSIMPLE QUERY EXAMPLES:\n(1) Past employer: query='job_profiles.company_name:\"Google\"'\n(2) Skills: query='skills:\"Python\"'\n(3) Current role: company='Acme Corp' and title='Engineer'\n\nCOMPLEX MULTI-CRITERIA EXAMPLES:\n(4) Multiple titles with skills: query='(current_title:\"Director\" OR current_title:\"Senior Director\") AND skills:\"financial due diligence\"'\n(5) Multiple role types at specific level: query='(current_title:(\"Deal Advisory\" OR \"Transaction Services\" OR \"Transaction Advisory\")) AND current_title:\"Director\" AND skills:\"due diligence\"'\n(6) Past companies with skills: query='(job_profiles.company_name:(\"KPMG\" OR \"Deloitte\" OR \"PwC\" OR \"EY\")) AND skills:(\"M&A\" OR \"financial due diligence\")'\n(7) Combined current AND past: query='current_title:\"Director\" AND job_profiles.company_name:(\"Big 4\") AND skills:\"financial modeling\"'\n(8) Tags: query='all_raw_tags:\"key account\"'\n\nNULL/EMPTY FIELD SEARCHES (data quality checks):\n(9) Candidates WITHOUT skills: query='NOT _exists_:skills'\n(10) Candidates WITH skills: query='_exists_:skills'\n(11) Candidates WITHOUT tags: query='NOT _exists_:all_raw_tags'\n(12) Candidates missing location: query='NOT _exists_:location'\n(13) Candidates missing current company: query='NOT _exists_:current_company'\n\nTIPS: Use OR for multiple options, AND to combine criteria, parentheses for grouping, NOT _exists_:fieldname for null checks. ALWAYS use search index field names (skills not skillsets) in queries. Start with comprehensive queries to get all relevant candidates in fewer API calls.\n\nWhen evaluating candidate fit for a role or preparing recommendations, follow up with loxo_get_candidate_brief for shortlisted candidates to get recruiter intake notes and recent activity context.\n\nReturns: id, name, current_title, current_company, location, skillsets (from 'skills' field), all_raw_tags. Use scroll_id from pagination for next page.",
         inputSchema: {
           type: "object",
           properties: {
@@ -624,7 +757,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "loxo_get_candidate",
-        description: "Get complete candidate profile including bio, location, current role, skills, tags, compensation, and embedded lists of jobs/education/emails/phones. Use this for overview. For guaranteed complete contact info or work history, use dedicated tools: loxo_get_person_emails, loxo_get_person_phones, loxo_list_person_job_profiles, loxo_list_person_education_profiles. Example: After searching candidates, use their ID here to get full details.",
+        description: "Get complete candidate profile including bio, location, current role, skills, tags, compensation, and embedded lists of jobs/education/emails/phones. The 'description' field contains the recruiter's call and intake notes — personal circumstances, motivations, compensation expectations, and role preferences. This is often the richest source of candidate intelligence. For a complete picture combining intake notes with recent activity (including Ringover call summaries), use loxo_get_candidate_brief instead. Example: After searching candidates, use their ID here to get full details.",
         inputSchema: {
           type: "object",
           properties: {
@@ -923,6 +1056,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "loxo_create_company",
+        description: "Create a new company (client/target account) record in Loxo. Currently only the name is accepted; additional fields (url, description, status) should be edited in the Loxo UI for now. Use after discovering a new client or target account during a conversation. Example: 'Add Acme Corp as a new client' → call this with name='Acme Corp'.",
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Company name (required)." },
+          },
+          required: ["name"],
+        },
+      },
+      {
         name: "loxo_list_users",
         description: "Get all users in your Loxo agency (recruiters, coordinators, etc.) with names and emails. Use this to find user_id values for filtering scheduled tasks or assigning ownership. Example: Get all recruiters to see who owns which candidates or to filter tasks by specific team member.",
         inputSchema: {
@@ -945,7 +1090,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "loxo_create_candidate",
-        description: "Create a new candidate record in Loxo with name, contact info, and current role. Source type is auto-set to 'API'. After creating, use loxo_update_candidate to set tags, skillsets, person_type, source_type, and sector — these fields require a separate PUT call. Example workflow: (1) loxo_create_candidate with name/email/phone/title/company, (2) loxo_update_candidate to add tags and skillset, (3) loxo_add_to_pipeline to add to a job.",
+        description: "Create a new candidate record in Loxo with name, contact info, and current role. Source type is auto-set to 'API'. Owner is set from the optional owned_by_id arg, or falls back to the LOXO_DEFAULT_OWNER_ID env var if configured. After creating, use loxo_update_candidate to set tags, skillsets, person_type, source_type, and sector — these fields require a separate PUT call. Example workflow: (1) loxo_create_candidate with name/email/phone/title/company, (2) loxo_update_candidate to add tags and skillset, (3) loxo_add_to_pipeline to add to a job.",
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
         inputSchema: {
           type: "object",
@@ -956,14 +1101,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             current_title: { type: "string", description: "Current job title." },
             current_company: { type: "string", description: "Current employer." },
             location: { type: "string", description: "City, region, or country." },
+            owned_by_id: { type: "string", description: "Loxo user ID to set as record owner. Overrides LOXO_DEFAULT_OWNER_ID env var if set." },
           },
           required: ["name"],
         },
       },
       {
         name: "loxo_update_candidate",
-        description: "Update an existing candidate's record in Loxo. Use to set tags, skillsets, sector, person type, source type, and basic profile fields. Tags and skillsets require specific field formats — this tool handles the conversion automatically. Use loxo_list_skillsets and loxo_list_person_types to discover valid IDs before calling.",
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        description: "Update an existing candidate's record in Loxo. Use to set tags, skillsets, sector, person type, source type, basic profile fields, compensation (salary, bonus, currency, salary_type), the description blob, and any other top-level person field via extra_fields. Tags are additive by default (does not remove existing); pass replace_tags=true for the destructive replace behaviour. Tags and skillsets require specific field formats: this tool handles the conversion automatically. Use loxo_list_skillsets and loxo_list_person_types to discover IDs. Use the dynamic_fields discovery probe to enumerate the valid extra_fields keys for the tenant.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
         inputSchema: {
           type: "object",
           properties: {
@@ -974,18 +1120,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             current_title: { type: "string", description: "Current job title." },
             current_company: { type: "string", description: "Current employer." },
             location: { type: "string", description: "City, region, or country." },
-            tags: { type: "array", items: { type: "string" }, description: "Tags to set. E.g. ['cv-import', 'debt-advisory']." },
+            tags: { type: "array", items: { type: "string" }, description: "Tags to add (additive by default, does not remove existing). Use replace_tags=true to set the full list explicitly. E.g. ['cv-import', 'debt-advisory']." },
+            replace_tags: { type: "boolean", description: "Default false (additive). Set to true to REPLACE existing tags with the provided array. Use with care: replace mode wipes any tags not in the input." },
             skillset_ids: { type: "array", items: { type: "number" }, description: "Skillset IDs from loxo_list_skillsets. E.g. [5704030] = Debt Advisory." },
             sector_ids: { type: "array", items: { type: "number" }, description: "Sector IDs from loxo_list_skillsets. E.g. [5690364] = Financial Services." },
             person_type_id: { type: "number", description: "Person type ID. 80073=Active Candidate, 78122=Prospect Candidate." },
             source_type_id: { type: "number", description: "Source type ID. 1206583=LinkedIn, 1206592=API." },
+            owned_by_id: { type: "string", description: "Loxo user ID to set as record owner. Overrides LOXO_DEFAULT_OWNER_ID env var." },
+            salary: { type: "number", description: "Current salary, numeric (no currency symbol). Pair with compensation_currency_id." },
+            compensation: { type: "number", description: "Total compensation including base + bonus + equity, numeric." },
+            compensation_currency_id: { type: "number", description: "Currency ID. Use loxo_list_currencies to discover IDs." },
+            salary_type_id: { type: "number", description: "Salary type ID (e.g. annual, hourly). Use loxo_list_salary_types to discover IDs." },
+            bonus: { type: "number", description: "Bonus amount, numeric." },
+            description: { type: "string", description: "The bio / recruiter notes blob. Free text. Replaces existing description." },
+            extra_fields: {
+              type: "object",
+              description: "Map of Loxo person field keys (top-level on the person object) to values. Use to set fields not covered by explicit parameters. E.g. { \"expected_salary\": 95000, \"rejection_reason\": \"comp expectations\", \"skillset_ids\": [12, 34] }. Arrays are written as person[<key>][] form entries (used for Hierarchy fields like skillsets and sectors).",
+              additionalProperties: {
+                oneOf: [
+                  { type: "string" },
+                  { type: "number" },
+                  { type: "array", items: { type: ["string", "number"] } }
+                ]
+              }
+            },
           },
           required: ["id"],
         },
       },
       {
         name: "loxo_get_candidate_activities",
-        description: "Get the activity history for a candidate — all calls, emails, meetings, and notes logged against them. Use before drafting outreach to see recent contact history and avoid re-pitching someone just spoken to. Returns most recent activities first. Example: Before emailing a candidate, call this to check if someone already contacted them last week.",
+        description: "Get the full unfiltered activity history for a candidate — all calls, emails, meetings, notes, pipeline moves, and automation events. Returns most recent activities first. Optionally filter by activity_type_ids (use loxo_get_activity_types to discover IDs). For a filtered view with only intel-rich activities (excluding pipeline noise), use loxo_get_candidate_brief instead. For the recruiter's own call/intake notes (motivations, personal circumstances, compensation), check the 'description' field via loxo_get_candidate or loxo_get_candidate_brief. Example: Before emailing a candidate, call this to check if someone already contacted them last week.",
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
         inputSchema: {
           type: "object",
@@ -994,18 +1159,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             per_page: { type: "number", description: "Results per page (default 20)." },
             scroll_id: { type: "string", description: "Pagination cursor from previous response." },
             response_format: { type: "string", enum: ["json", "markdown"], description: "Response format: 'json' (default) or 'markdown'." },
+            activity_type_ids: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional filter to only specific activity types (e.g., only calls or only emails). Use loxo_get_activity_types first to discover IDs.",
+            },
           },
           required: ["person_id"],
         },
       },
       {
         name: "loxo_get_candidate_brief",
-        description: "Get a complete candidate brief in one call: full profile, all contact details, and 5 most recent activities. Use this as the first step before drafting any outreach — it gives you everything you need to write a personalised message without making multiple API calls. Returns: profile fields, email list, phone list, recent_activities (last 5).",
+        description: "Get a complete candidate brief in one call: full profile (including recruiter intake/call notes in the 'description' field), all contact details, and recent intel-rich activities (calls, emails, notes, interviews — filtered to exclude pipeline moves and automation noise). Use this as the first step whenever you need full candidate context — before drafting outreach, preparing client briefing packs, pipeline status updates, or evaluating candidate-role fit. The combination of intake notes and activity history gives the most complete picture of a candidate. Supports pagination via scroll_id for retrieving older activity when you need to dig deeper (e.g. finding salary expectations from an earlier conversation). Returns: profile fields, email list, phone list, recent_activities (intel-rich only), activity_pagination.",
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
         inputSchema: {
           type: "object",
           properties: {
             id: { type: "string", description: "The candidate's person ID (required)." },
+            scroll_id: { type: "string", description: "Pagination cursor for older intel-rich activities." },
             response_format: { type: "string", enum: ["json", "markdown"], description: "Response format: 'json' (default) or 'markdown'." },
           },
           required: ["id"],
@@ -1013,7 +1184,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "loxo_get_job_pipeline",
-        description: "Get all candidates in the pipeline for a specific job, with their current stage. Use for pipeline reviews — see who's at which stage, identify stalled candidates, and plan next actions. Example: 'Show me the pipeline for job 456' returns all candidates and their stage (sourced, screened, interviewing, offer, placed).",
+        description: "Get all candidates in the pipeline for a specific job, with their current stage. Returns candidate IDs and pipeline stages only. For client briefing packs or status updates, follow up with loxo_get_candidate_brief for each candidate to get their intake notes, personal context, and recent activity (including Ringover call summaries). Example: 'Show me the pipeline for job 456' returns all candidates and their stage (sourced, screened, interviewing, offer, placed).",
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
         inputSchema: {
           type: "object",
@@ -1072,6 +1243,155 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
         inputSchema: { type: "object", properties: {}, required: [] },
       },
+      {
+        name: "loxo_list_deal_workflows",
+        description: "List all deal workflows (pipelines) with their IDs and names. Use the returned workflow ID with loxo_get_deal_workflow to see pipeline stages, or pass it to loxo_get_activity_types to get deal-specific activity types.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            response_format: {
+              type: "string",
+              enum: ["json", "markdown"],
+              description: "Response format: 'json' for structured data (default), 'markdown' for human-readable formatted text"
+            }
+          },
+          required: [],
+        },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: "loxo_get_deal_workflow",
+        description: "Get a single deal workflow including its pipeline stages. Use the returned pipeline_stage_id values when creating deals with loxo_create_deal.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description: "Deal workflow ID"
+            },
+            response_format: {
+              type: "string",
+              enum: ["json", "markdown"],
+              description: "Response format: 'json' for structured data (default), 'markdown' for human-readable formatted text"
+            }
+          },
+          required: ["id"],
+        },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: "loxo_search_deals",
+        description: "Search and list deals with optional Lucene query, owner email filter, and cursor-based pagination. Returns deals with pagination metadata. Use loxo_list_deal_workflows first to understand which pipelines exist.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Lucene query string (optional)"
+            },
+            owner_emails: {
+              type: "array",
+              items: { type: "string" },
+              description: "Filter by owner email addresses (optional)"
+            },
+            scroll_id: {
+              type: "string",
+              description: "Pagination cursor from previous search results"
+            },
+            response_format: {
+              type: "string",
+              enum: ["json", "markdown"],
+              description: "Response format: 'json' for structured data (default), 'markdown' for human-readable formatted text"
+            }
+          },
+          required: [],
+        },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: "loxo_get_deal",
+        description: "Get full details of a single deal by ID, including name, amount, close date, pipeline stage, and linked company/person/job.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description: "Deal ID"
+            },
+            response_format: {
+              type: "string",
+              enum: ["json", "markdown"],
+              description: "Response format: 'json' for structured data (default), 'markdown' for human-readable formatted text"
+            }
+          },
+          required: ["id"],
+        },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: "loxo_create_deal",
+        description: "Create a new deal in a pipeline. Requires name, amount, close date, workflow_id, and pipeline_stage_id. Use loxo_list_deal_workflows and loxo_get_deal_workflow to find valid workflow and stage IDs. Owner email falls back to LOXO_DEFAULT_OWNER_EMAIL env var if not provided. Optionally link to a company, person, or job.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Deal name (required)" },
+            amount: { type: "number", description: "Deal value/amount (required)" },
+            closes_at: { type: "string", description: "Expected close date, ISO datetime (required)" },
+            workflow_id: { type: "string", description: "Deal workflow/pipeline ID (required). Use loxo_list_deal_workflows to find." },
+            pipeline_stage_id: { type: "string", description: "Initial pipeline stage ID (required). Use loxo_get_deal_workflow to find stage IDs." },
+            owner_email: { type: "string", description: "Owner email. Falls back to LOXO_DEFAULT_OWNER_EMAIL env var." },
+            company_id: { type: "string", description: "Associated company ID (optional)" },
+            person_id: { type: "string", description: "Associated person/contact ID (optional)" },
+            job_id: { type: "string", description: "Associated job ID (optional)" },
+          },
+          required: ["name", "amount", "closes_at", "workflow_id", "pipeline_stage_id"],
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      {
+        name: "loxo_log_deal_activity",
+        description: "Log an activity or event on a deal (e.g. 'Deal Won', 'Meeting', 'Note'). Use loxo_get_activity_types with the deal's workflow_id to find valid activity_type_id values — deal activity types are different from candidate activity types.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            deal_id: { type: "string", description: "Deal ID" },
+            activity_type_id: { type: "string", description: "Activity type ID. Use loxo_get_activity_types with workflow_id to find valid IDs." },
+            notes: { type: "string", description: "Optional notes for this activity" },
+          },
+          required: ["deal_id", "activity_type_id"],
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
     ]
   };
 });
@@ -1083,8 +1403,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "loxo_get_activity_types": {
-        const { response_format = 'json' } = args as any;
-        const response = await makeRequest(`/${env.LOXO_AGENCY_SLUG}/activity_types`);
+        const { response_format = 'json', workflow_id } = args as any;
+        let endpoint = `/${env.LOXO_AGENCY_SLUG}/activity_types`;
+        if (workflow_id) {
+          requireNumericId(workflow_id, 'workflow_id');
+          endpoint += `?workflow_id=${workflow_id}`;
+        }
+        const response = await makeRequest(endpoint);
         const formatted = formatResponse(response, response_format as 'json' | 'markdown');
         const { text } = truncateResponse(formatted);
         return {
@@ -1468,7 +1793,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "loxo_create_candidate": {
-        const { name, email, phone, current_title, current_company, location } = CreateCandidateSchema.parse(args);
+        const { name, email, phone, current_title, current_company, location, owned_by_id } = CreateCandidateSchema.parse(args);
 
         const formData = new URLSearchParams();
         formData.append('person[name]', name);
@@ -1477,6 +1802,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (current_title) formData.append('person[title]', current_title);
         if (current_company) formData.append('person[company]', current_company);
         if (location) formData.append('person[location]', location);
+
+        const resolvedOwnerId = resolveOwnerId(owned_by_id);
+        if (resolvedOwnerId) {
+          formData.append('person[owned_by_id]', resolvedOwnerId);
+        }
 
         const response = await makeRequest(
           `/${env.LOXO_AGENCY_SLUG}/people`,
@@ -1492,7 +1822,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "loxo_update_candidate": {
-        const { id, name: updateName, email, phone, current_title, current_company, location, tags, skillset_ids, sector_ids, person_type_id, source_type_id } = UpdateCandidateSchema.parse(args);
+        const { id, name: updateName, email, phone, current_title, current_company, location, tags, replace_tags, skillset_ids, sector_ids, person_type_id, source_type_id, owned_by_id, salary, compensation, compensation_currency_id, salary_type_id, bonus, description, extra_fields } = UpdateCandidateSchema.parse(args);
 
         const formData = new URLSearchParams();
         if (updateName) formData.append('person[name]', updateName);
@@ -1504,8 +1834,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (person_type_id) formData.append('person[person_type_id]', person_type_id.toString());
         if (source_type_id) formData.append('person[source_type_id]', source_type_id.toString());
         if (tags) {
+          const fieldName = replace_tags ? 'person[all_raw_tags][]' : 'person[raw_tags][]';
           for (const tag of tags) {
-            formData.append('person[all_raw_tags][]', tag);
+            formData.append(fieldName, tag);
           }
         }
         if (skillset_ids) {
@@ -1517,6 +1848,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           for (const sid of sector_ids) {
             formData.append('person[custom_hierarchy_2][]', sid.toString());
           }
+        }
+
+        if (salary !== undefined) formData.append('person[salary]', salary.toString());
+        if (compensation !== undefined) formData.append('person[compensation]', compensation.toString());
+        if (compensation_currency_id !== undefined) formData.append('person[compensation_currency_id]', compensation_currency_id.toString());
+        if (salary_type_id !== undefined) formData.append('person[salary_type_id]', salary_type_id.toString());
+        if (bonus !== undefined) formData.append('person[bonus]', bonus.toString());
+        if (description !== undefined) formData.append('person[description]', description);
+
+        if (extra_fields) {
+          // Optional schema-cache check. If the server has loaded /dynamic_fields at
+          // startup, prefer membership in the cached Person key set; otherwise fall
+          // back to the SAFE_PERSON_FIELD_KEY regex. Built-in keys (salary,
+          // compensation, etc.) appear in /dynamic_fields with built_in: true so
+          // the cache covers both kinds.
+          const personKeyCache: Set<string> | null = globalThis.LOXO_PERSON_KEY_CACHE ?? null;
+          for (const [key, value] of Object.entries(extra_fields)) {
+            const allowed = personKeyCache ? personKeyCache.has(key) : SAFE_PERSON_FIELD_KEY.test(key);
+            if (!allowed) {
+              return {
+                content: [{ type: "text", text: `Invalid extra_fields key: ${key}. Not in cached Person dynamic_fields schema and does not match safe-key pattern.` }],
+                isError: true,
+              };
+            }
+            if (Array.isArray(value)) {
+              // Hierarchy fields (skillset_ids, sector_ids, custom_hierarchy_*) come
+              // back from Loxo as arrays per Phase 0.3 verification, so they must be
+              // written via person[<key>][] form entries (one append per element).
+              // value.toString() on an array would join with commas, which Loxo treats
+              // as a single string and silently drops.
+              for (const v of value) formData.append(`person[${key}][]`, v.toString());
+            } else {
+              formData.append(`person[${key}]`, value.toString());
+            }
+          }
+        }
+
+        const resolvedOwnerId = resolveOwnerId(owned_by_id);
+        if (resolvedOwnerId) {
+          formData.append('person[owned_by_id]', resolvedOwnerId);
         }
 
         if (formData.toString() === '') {
@@ -1539,13 +1910,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "loxo_create_company": {
+        const { name } = CreateCompanySchema.parse(args);
+
+        const formData = new URLSearchParams();
+        formData.append('company[name]', name);
+
+        const response = await makeRequest(
+          `/${env.LOXO_AGENCY_SLUG}/companies`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: formData.toString(),
+          }
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
+        };
+      }
+
       case "loxo_get_candidate_activities": {
-        const { person_id, per_page, scroll_id, response_format = 'json' } = args as any;
+        const { person_id, per_page, scroll_id, response_format = 'json', activity_type_ids } = GetCandidateActivitiesSchema.parse(args);
 
         const params = new URLSearchParams();
-        params.append('person_id', person_id.toString());
+        params.append('person_id', person_id);
         if (per_page) params.append('per_page', per_page.toString());
         if (scroll_id) params.append('scroll_id', scroll_id);
+        if (activity_type_ids) {
+          for (const id of activity_type_ids) {
+            params.append('activity_type_ids[]', id);
+          }
+        }
 
         const apiResponse: any = await makeRequest(
           `/${env.LOXO_AGENCY_SLUG}/person_events?${params.toString()}`
@@ -1568,15 +1963,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "loxo_get_candidate_brief": {
-        const { id, response_format = 'json' } = args as any;
+        const { id, scroll_id, response_format = 'json' } = args as any;
 
         requireNumericId(id, 'id');
+
+        const activityParams = new URLSearchParams();
+        activityParams.append('person_id', id.toString());
+        activityParams.append('per_page', '50');
+        if (scroll_id) activityParams.append('scroll_id', scroll_id);
 
         const [profileResult, emailsResult, phonesResult, activitiesResult] = await Promise.allSettled([
           makeRequest<Candidate>(`/${env.LOXO_AGENCY_SLUG}/people/${id}`),
           makeRequest<EmailInfo[]>(`/${env.LOXO_AGENCY_SLUG}/people/${id}/emails`),
           makeRequest<PhoneInfo[]>(`/${env.LOXO_AGENCY_SLUG}/people/${id}/phones`),
-          makeRequest<any>(`/${env.LOXO_AGENCY_SLUG}/person_events?person_id=${id}&per_page=5`),
+          makeRequest<any>(`/${env.LOXO_AGENCY_SLUG}/person_events?${activityParams.toString()}`),
         ]);
 
         if (profileResult.status === 'rejected') {
@@ -1588,18 +1988,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const phones = phonesResult.status === 'fulfilled' ? phonesResult.value : [];
         const activitiesResponse = activitiesResult.status === 'fulfilled' ? activitiesResult.value : null;
 
-        const recentActivities = activitiesResponse?.person_events
+        const allActivities = activitiesResponse?.person_events
           || activitiesResponse?.events
           || activitiesResponse
           || [];
+
+        const filteredActivities = Array.isArray(allActivities)
+          ? allActivities.filter((a: { activity_type_id: number }) => !NOISE_ACTIVITY_TYPE_IDS.has(a.activity_type_id))
+          : [];
 
         const brief = {
           profile,
           emails,
           phones,
-          recent_activities: Array.isArray(recentActivities)
-            ? recentActivities.slice(0, 5)
-            : [],
+          recent_activities: filteredActivities,
+          activity_pagination: {
+            scroll_id: activitiesResponse?.scroll_id || null,
+            has_more: !!(activitiesResponse?.scroll_id),
+          },
         };
 
         const formatted = formatResponse(brief, response_format as 'json' | 'markdown');
@@ -1673,6 +2079,126 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             method: 'POST',
             body: formData,
             // Do NOT set Content-Type — fetch sets it automatically with boundary for FormData
+          }
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
+        };
+      }
+
+      case "loxo_list_deal_workflows": {
+        const { response_format = 'json' } = ListDealWorkflowsSchema.parse(args);
+        const response = await makeRequest(`/${env.LOXO_AGENCY_SLUG}/deal_workflows`);
+        const formatted = formatResponse(response, response_format as 'json' | 'markdown');
+        const { text } = truncateResponse(formatted);
+        return {
+          content: [{ type: "text", text }]
+        };
+      }
+
+      case "loxo_get_deal_workflow": {
+        const { id, response_format = 'json' } = GetDealWorkflowSchema.parse(args);
+        requireNumericId(id, 'id');
+        const response = await makeRequest(`/${env.LOXO_AGENCY_SLUG}/deal_workflows/${id}`);
+        const formatted = formatResponse(response, response_format as 'json' | 'markdown');
+        const { text } = truncateResponse(formatted);
+        return {
+          content: [{ type: "text", text }]
+        };
+      }
+
+      case "loxo_search_deals": {
+        const { query, owner_emails, scroll_id, response_format = 'json' } = SearchDealsSchema.parse(args);
+
+        const searchParams = new URLSearchParams();
+        if (query) searchParams.append('query', query);
+        if (scroll_id) searchParams.append('scroll_id', scroll_id);
+        if (owner_emails) {
+          for (const email of owner_emails) {
+            searchParams.append('owner_emails[]', email);
+          }
+        }
+
+        const apiResponse: any = await makeRequest(
+          `/${env.LOXO_AGENCY_SLUG}/deals?${searchParams.toString()}`
+        );
+
+        const deals = apiResponse?.deals || apiResponse || [];
+        const toolResponse = {
+          results: Array.isArray(deals) ? deals : [],
+          pagination: {
+            scroll_id: apiResponse?.scroll_id || null,
+            has_more: !!(apiResponse?.scroll_id),
+            total_count: apiResponse?.total_count || 0,
+            returned_count: Array.isArray(deals) ? deals.length : 0,
+          },
+        };
+
+        const formatted = formatResponse(toolResponse, response_format as 'json' | 'markdown');
+        const { text } = truncateResponse(formatted);
+        return { content: [{ type: "text", text }] };
+      }
+
+      case "loxo_get_deal": {
+        const { id, response_format = 'json' } = GetDealSchema.parse(args);
+        requireNumericId(id, 'id');
+        const response = await makeRequest(`/${env.LOXO_AGENCY_SLUG}/deals/${id}`);
+        const formatted = formatResponse(response, response_format as 'json' | 'markdown');
+        const { text } = truncateResponse(formatted);
+        return {
+          content: [{ type: "text", text }]
+        };
+      }
+
+      case "loxo_create_deal": {
+        const { name, amount, closes_at, workflow_id, pipeline_stage_id, owner_email, company_id, person_id, job_id } = CreateDealSchema.parse(args);
+
+        const resolvedEmail = resolveOwnerEmail(owner_email);
+        if (!resolvedEmail) {
+          return {
+            content: [{ type: "text", text: "owner_email is required but was not provided and LOXO_DEFAULT_OWNER_EMAIL is not set. Use loxo_list_users to find valid email addresses." }],
+            isError: true,
+          };
+        }
+
+        const formData = new URLSearchParams();
+        formData.append('deal[name]', name);
+        formData.append('deal[amount]', amount.toString());
+        formData.append('deal[closes_at]', closes_at);
+        formData.append('deal[workflow_id]', workflow_id);
+        formData.append('deal[pipeline_stage_id]', pipeline_stage_id);
+        formData.append('deal[owner_email]', resolvedEmail);
+        if (company_id) formData.append('deal[company_id]', company_id);
+        if (person_id) formData.append('deal[person_id]', person_id);
+        if (job_id) formData.append('deal[job_id]', job_id);
+
+        const response = await makeRequest(
+          `/${env.LOXO_AGENCY_SLUG}/deals`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: formData.toString(),
+          }
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
+        };
+      }
+
+      case "loxo_log_deal_activity": {
+        const { deal_id, activity_type_id, notes } = LogDealActivitySchema.parse(args);
+        requireNumericId(deal_id, 'deal_id');
+
+        const formData = new URLSearchParams();
+        formData.append('activity_type_id', activity_type_id);
+        if (notes) formData.append('notes', notes);
+
+        const response = await makeRequest(
+          `/${env.LOXO_AGENCY_SLUG}/deals/${deal_id}/events`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: formData.toString(),
           }
         );
         return {
