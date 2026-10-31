@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "loxo": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@smithery/cli", "run", "loxo-mcp-server"],
+      "env": {
+        "LOXO_API_KEY": "${LOXO_API_KEY}",
+        "LOXO_AGENCY_SLUG": "${LOXO_AGENCY_SLUG}",
+        "LOXO_DOMAIN": "${LOXO_DOMAIN:-app.loxo.co}"
+      }
+    }
+  }
+}

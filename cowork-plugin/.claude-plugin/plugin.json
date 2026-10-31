@@ -1,0 +1,13 @@
+{
+  "name": "loxo",
+  "version": "1.0.0",
+  "description": "Recruiting CRM tools for staffing and contingency search firms — search candidates, manage job pipelines, log activities, and create deals powered by Loxo ATS.",
+  "author": {
+    "name": "Velocity Staffing LLC",
+    "url": "https://velocitystaffingllc.com"
+  },
+  "repository": "https://github.com/nickm248/loxo-mcp-server",
+  "homepage": "https://tbensonwest.github.io/loxo-mcp-server/",
+  "license": "MIT",
+  "keywords": ["loxo", "recruiting", "ats", "staffing", "candidates", "pipeline", "crm", "contingency"]
+}
